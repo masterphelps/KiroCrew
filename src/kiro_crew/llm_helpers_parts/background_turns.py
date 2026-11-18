@@ -521,6 +521,19 @@ async def _start_fresh_conversation(sessions: Any, key: str, client: Any) -> Non
         logger.debug("ending %s's children before a fresh conversation failed", key, exc_info=True)
     new_conversation = getattr(client, "new_conversation", None)
     if callable(new_conversation):
+        # The same record as ``swap_conversation``: a Bot-chat app stop names this
+        # fresh session, and a stop already running refuses it (the reset below is
+        # a cold start, which its ending fence holds).
+        from kiro_crew.bot_chat_ending_fence import (
+            begin_swap,
+            close_outrun_replacement,
+            end_swap,
+            fold_session_key,
+        )
+
+        folded = fold_session_key(sessions, key)
+        new_conversation = new_conversation if begin_swap(folded) else None
+    if callable(new_conversation):
         try:
             await new_conversation()
         except Exception:
@@ -528,6 +541,12 @@ async def _start_fresh_conversation(sessions: Any, key: str, client: Any) -> Non
         else:
             logger.info("Background session %s: fresh conversation on the same runtime", key)
             return
+        finally:
+            if end_swap(folded):
+                try:
+                    close_outrun_replacement(folded, client)
+                except Exception:
+                    logger.warning("keeping %s's replacement for its close failed", key)
     try:
         await sessions.reset(key, ends_conversation=True)
     except Exception:

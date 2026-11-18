@@ -16,7 +16,7 @@ Instance fields written: ``_activated_model``, ``_agent_accepts_image``,
 ``_mode_frame_superseded``, ``_native_skill_projection``, ``_pid``, ``_process``,
 ``_process_adapter``, ``_process_instance``, ``_process_tree_confirmed_dead``,
 ``_resume_session_id``, ``_resumed``, ``_scope_unit``, ``_session_id``,
-``_spawn_start_token``, ``_start_time``, ``_stderr_task``, ``_work_dir_ready``.
+``_spawn_start_token``, ``_spawned``, ``_start_time``, ``_stderr_task``, ``_work_dir_ready``.
 
 Instance fields read: ``_agent``, ``_available_mode_ids``, ``_batch_window``,
 ``_channel_id``, ``_extra_env``, ``_model``, ``_modes_advertised``, ``_sandbox_mode``,
@@ -523,6 +523,7 @@ async def _spawn(self: AcpClient) -> None:
         _launch_tools(),
     )
     self._process = launched.process
+    self._spawned = True
     self._pid = self._process.pid
     self._kill_sent = None
     self._process_tree_confirmed_dead = False
