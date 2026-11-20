@@ -161,6 +161,13 @@ def vault_identity() -> str:
 
     if workload_identity.active():
         return workload_identity.catalog_identity()
+    # An edition engine credential keys the rows by its own identity: the vault is empty
+    # there, and the engine lists what that credential is served.
+    from kiro_crew.agent_sdk.kas_engine_auth import active_engine_auth
+
+    engine_key = getattr(active_engine_auth(), "catalog_identity", "")
+    if isinstance(engine_key, str) and engine_key:
+        return engine_key
     # Deferred: kiro_crew.auth pulls the ``cryptography`` wheel, which must not
     # load on the session drivers' import path (see kiro_crew.acp.kas_host_auth).
     from kiro_crew.auth.bridge import vault_identity_fingerprint

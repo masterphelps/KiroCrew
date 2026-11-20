@@ -395,6 +395,7 @@ async def _resolve_spawn_plan(self: AcpRuntime) -> SpawnPlan:
         raise AcpRuntimeError(str(exc)) from exc
     self._kas_host_auth = plan.host_auth
     self._kas_engine_bundle = plan.engine_bundle
+    self._kas_engine_auth = plan.engine_auth
     self._native_launch_sources = dict(plan.native_context_documents)
     self._native_launch_view_alias = None
     self._native_launch_resources = None

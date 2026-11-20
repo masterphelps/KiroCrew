@@ -2442,6 +2442,32 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "developer.close-finished-remote-crew-setup-cards",
+    "label": "Close finished Remote Crew setup cards",
+    "labelKey": "pages.developer.featurePreviewsTab.launch_card_close",
+    "description": "A finished setup card gets a close button and goes away by itself. The crew stays in My Crews.",
+    "hint": "When a new Remote Crew finishes setting up, its card under Settings > Remote Crew gets a close button. It also closes by itself 2 minutes after it finished, and stays closed after a reload. The crew itself stays in My Crews.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
+    "id": "developer.company-sign-in-only-if-your-build-includes-one",
+    "label": "Company sign-in (only if your build includes one)",
+    "labelKey": "pages.developer.featurePreviewsTab.crew_client",
+    "description": "Your current sign-in is kept; nothing changes without a company setup.",
+    "hint": "Some builds of Kiro Crew come with their company's own sign-in setup for one IAM Identity Center portal, and can start the agent with a credential the host provides. Turn this on to use them. A build without such a setup changes nothing.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
     "id": "developer.connected-computers",
     "label": "Connected computers",
     "labelKey": "connectedComputers.preview.label",
