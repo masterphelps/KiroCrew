@@ -1,0 +1,13 @@
++305
+A code-loader name written as a method (`re.compile`) was resolved as the builtin
+by its bare word alone, so a regex pattern naming the product tripped the mint
+check. The resolver now reads the receiver and fails closed: `compile` as a method
+is the builtin unless its receiver is a name whose SOLE binding is one plain import
+of a non-owner module. Binding analysis is AST-based over every binding form
+(assignment/tuple/annotated/attribute target, def/class name, def/lambda param,
+except/match target, global/nonlocal), a write through globals/vars/locals/__dict__/
+setattr or sys.modules exempts nothing, and ANY attribute store (an alias or
+computed rebind of a module's attribute, e.g. `m = re; m.compile = exec`) exempts
+nothing either. A word-split heredoc uses a conservative lexical fallback. The
+receiver walk and the shared exemption check cover the three sites that resolve a
+loader by a dotted head.

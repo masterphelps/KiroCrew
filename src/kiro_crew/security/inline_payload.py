@@ -78,6 +78,21 @@ _CALLABLE_MODULES = {
     "importlib": frozenset({"import_module"}),
     "builtins": _INLINE_CODE_LOADER_NAMES | frozenset({"__import__"}),
 }
+#: Modules a code-loader name is the real builtin OFF OF (``re.compile`` is not).
+_LOADER_OWNER_MODULES = frozenset(_CALLABLE_MODULES)
+#: Augmented-assign operators, each a single token; the name(s) left of one are rebound.
+_AUGMENTED_ASSIGN = frozenset(
+    {"+=", "-=", "*=", "/=", "//=", "%=", "**=", "&=", "|=", "^=", ">>=", "<<=", "@="}
+)
+#: A write a static binding walk cannot follow -- it rebinds a name, swaps a
+#: module attribute, or swaps the module object via ``sys.modules[...]`` -- so it exempts NOTHING.
+_DYNAMIC_REBIND_RE = re.compile(r"\b(?:setattr|globals|vars|locals)\s*\(|__dict__|\bmodules\s*\[")
+#: An attribute store (``m.compile = exec``) can rebind what ``re.compile`` resolves
+#: to through an alias the walk cannot follow; covers the word-split lexical view.
+_ATTR_STORE_RE = re.compile(r"\.\s*[A-Za-z_]\w*\s*(?:\*\*|//|<<|>>|[-+*/%&|^@])?=(?![=])")
+#: Keywords that introduce a binding the word-split lexical fallback cannot track
+#: name-by-name; in an unparsable view any of them means exempt nothing.
+_LEXICAL_POISON_RE = re.compile(r"\b(?:class|def|lambda|global|nonlocal|match|case)\b")
 _GETATTR_CALL_RE = re.compile(r"(?<![a-z0-9_])getattr\s*\(")
 _ATTRIBUTE_NAME_LITERAL_RE = re.compile(r"""(["'])([A-Za-z_]\w*)\1""")
 #: ``m.__dict__["exec"]`` names a callable through a subscript, which is not a
@@ -341,6 +356,274 @@ def _preceded_by_attribute_access(view: str, position: int) -> bool:
     return cursor >= 0 and view[cursor] == "."
 
 
+def _attribute_receiver(view: str, position: int) -> str | None:
+    """The bare identifier the name at *position* is an attribute of, or ``None``.
+
+    Reads back over the ``.`` to the receiver word: ``re.compile`` has receiver
+    ``re``, ``b.compile`` has ``b``. A computed receiver (``foo().compile``,
+    ``a.b.compile``) returns ``None`` here -- it is not a plain module name, so it
+    cannot be one of the loader-owning modules.
+    """
+    cursor = position - 1
+    while cursor >= 0 and view[cursor].isspace():
+        cursor -= 1
+    if cursor < 0 or view[cursor] != ".":
+        return None
+    cursor -= 1
+    while cursor >= 0 and view[cursor].isspace():
+        cursor -= 1
+    end = cursor + 1
+    while cursor >= 0 and (view[cursor].isalnum() or view[cursor] == "_"):
+        cursor -= 1
+    start = cursor + 1
+    if start >= end:
+        return None
+    probe = start - 1
+    while probe >= 0 and view[probe].isspace():
+        probe -= 1
+    if probe >= 0 and view[probe] in ").].":
+        return None  # a dotted / computed receiver (``ns.re``, ``foo().re``, ``x[0].re``)
+    return view[start:end]
+
+
+def _name_bindings(view: str) -> "dict[str, list[str]]":
+    """Every name the payload binds, to the list of ways it is bound.
+
+    When the view parses, the AST is walked for EVERY binding form, treated as one
+    class: an assignment / tuple / annotated / augmented target (``Name`` store),
+    an attribute or subscript store on a name (``re.exec = ...`` rebinds what the
+    call runs), a ``def``/``lambda`` parameter, a ``def``/``class`` name, an
+    ``except ... as`` target, a ``match`` capture, a ``global``/``nonlocal``
+    declaration, and an import alias. A view that does not parse (a heredoc body
+    the shell split into words) falls back to :func:`_name_bindings_lexical`.
+    Writes through ``globals()``/``vars()``/``locals()``/``__dict__``/``setattr``
+    are handled in :func:`_foreign_module_names`, which exempts nothing when one
+    is present, since those rebind a name the static walk cannot see. A name is an
+    exempting module only when its sole tag is a single ``import`` of a non-owner
+    module, so any other tag -- or a second import -- disqualifies it.
+    """
+    try:
+        tree = ast.parse(view)
+    except (SyntaxError, ValueError, RecursionError, MemoryError, SystemError):
+        return _name_bindings_lexical(view)
+    bindings: dict[str, list[str]] = {}
+
+    def add(name: str, tag: str) -> None:
+        bindings.setdefault(name, []).append(tag)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                head = alias.name.split(".")[0]
+                add(
+                    alias.asname or head,
+                    "owner-import" if head in _LOADER_OWNER_MODULES else "import",
+                )
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                add(alias.asname or alias.name, "from")
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            add(node.id, "assign")
+        elif (
+            isinstance(node, (ast.Attribute, ast.Subscript))
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and isinstance(node.value, ast.Name)
+        ):
+            add(node.value.id, "attr-store")
+        elif isinstance(node, ast.arg):
+            add(node.arg, "param")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            add(node.name, "def")
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            add(node.name, "except")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for declared in node.names:
+                add(declared, "global")
+        elif isinstance(node, ast.MatchAs) and node.name:
+            add(node.name, "match")
+        elif isinstance(node, ast.MatchStar) and node.name:
+            add(node.name, "match")
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            add(node.rest, "match")
+    return bindings
+
+
+def _name_bindings_lexical(view: str) -> "dict[str, list[str]]":
+    """Binding scan for a view the parser rejects -- a heredoc body split into words.
+
+    Imports are read layout-tolerant so ``import`` and its module stay adjacent
+    across the inserted newlines. Every other binding is read conservatively: only
+    ``;`` ends a target region (a split-in newline does not), so a target the
+    split separated from its ``=`` is still caught, at the cost of over-denying an
+    unrelated name used earlier in the same ``;``-run -- the safe direction, since
+    a missed binding would exempt the loader, never the reverse.
+
+    A shadowing keyword (``class``/``def``/``lambda``/``global``/``nonlocal``/
+    ``match``/``case``) cannot be tracked name-by-name once the body is word-split,
+    so its presence here exempts nothing: return no bindings at all.
+    """
+    if _LEXICAL_POISON_RE.search(view):
+        return {}
+    layout = (tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT)
+    toks = [
+        item
+        for item, _, _ in _lex(view)
+        if item.type not in (tokenize.COMMENT, tokenize.NL, tokenize.ENCODING, tokenize.ENDMARKER)
+    ]
+    bindings: dict[str, list[str]] = {}
+
+    def add(name: str, tag: str) -> None:
+        bindings.setdefault(name, []).append(tag)
+
+    n = len(toks)
+
+    def skip_layout(k: int) -> int:
+        while k < n and toks[k].type in layout:
+            k += 1
+        return k
+
+    depth = 0
+    stmt_start = 0
+    i = 0
+    while i < n:
+        word = toks[i].string
+        is_name = toks[i].type == token.NAME
+        if is_name and word in ("import", "from"):
+            is_from = word == "from"
+            j = skip_layout(i + 1)
+            if is_from:
+                while (
+                    j < n
+                    and (toks[j].type == token.NAME or toks[j].string == ".")
+                    and toks[j].string != "import"
+                ):
+                    j = skip_layout(j + 1)
+                j = skip_layout(j + 1) if j < n and toks[j].string == "import" else j
+                if j < n and toks[j].string == "(":
+                    j = skip_layout(j + 1)
+            while j < n and toks[j].type == token.NAME:
+                head = toks[j].string
+                bound = head
+                j = skip_layout(j + 1)
+                while not is_from and j < n and toks[j].string == ".":
+                    k = skip_layout(j + 1)
+                    if k < n and toks[k].type == token.NAME:
+                        j = skip_layout(k + 1)
+                    else:
+                        break  # ``import re.`` with no name after the dot -- stop, do not spin
+                if j < n and toks[j].string == "as":
+                    k = skip_layout(j + 1)
+                    if k < n and toks[k].type == token.NAME:
+                        bound = toks[k].string
+                        j = skip_layout(k + 1)
+                add(
+                    bound,
+                    (
+                        "from"
+                        if is_from
+                        else ("owner-import" if head in _LOADER_OWNER_MODULES else "import")
+                    ),
+                )
+                if j < n and toks[j].string == ",":
+                    j = skip_layout(j + 1)
+                    continue
+                break
+            i = stmt_start = j
+            continue
+        if toks[i].type == token.OP and word in ("(", "[", "{"):
+            depth += 1
+        elif toks[i].type == token.OP and word in (")", "]", "}"):
+            depth = max(0, depth - 1)
+        if word == ";":
+            stmt_start = i + 1
+        elif depth == 0 and toks[i].type == token.OP and (word == "=" or word in _AUGMENTED_ASSIGN):
+            for k in range(stmt_start, i):
+                if toks[k].type == token.NAME:
+                    add(toks[k].string, "assign")
+            stmt_start = i + 1
+        elif toks[i].type == token.OP and word == ":=":
+            k = i - 1
+            while k >= 0 and toks[k].type in layout:
+                k -= 1
+            if k >= 0 and toks[k].type == token.NAME:
+                add(toks[k].string, "assign")
+        elif is_name and word == "for":
+            j = i + 1
+            while j < n and toks[j].string != "in" and toks[j].type not in layout:
+                if toks[j].type == token.NAME:
+                    add(toks[j].string, "for")
+                j += 1
+            i = j  # skip the scanned target list; re-scanning it is quadratic
+            continue
+        elif is_name and word == "as":
+            j = skip_layout(i + 1)
+            if j < n and toks[j].type == token.NAME:
+                add(toks[j].string, "as")
+        i += 1
+    return bindings
+
+
+def _foreign_module_names(view: str) -> frozenset[str]:
+    """Names PROVEN to be an unrelated module, the only exempting receivers.
+
+    A name qualifies only when its SOLE binding is one plain ``import`` of a
+    non-owner module (``import re`` -> ``re``). An owner import, a ``from`` import,
+    any assignment, loop, ``with``/``except``/``match`` target, a ``def``/``class``
+    name, a ``global``/``nonlocal`` declaration, or a second import all disqualify
+    it. And a payload that writes through ``globals()``/``vars()``/``locals()``/
+    ``__dict__``/``setattr``, swaps the module object via ``sys.modules[...]``, or
+    stores into ANY attribute (``m = re; m.compile = exec``, ``[re][0].compile =
+    exec``) -- any of which can rebind a name or what ``re.compile`` resolves to
+    through an alias or computed reference the static walk cannot follow --
+    exempts NOTHING at all.
+    """
+    if _DYNAMIC_REBIND_RE.search(view) or _rebinds_an_attribute(view):
+        return frozenset()
+    return frozenset(name for name, tags in _name_bindings(view).items() if tags == ["import"])
+
+
+def _rebinds_an_attribute(view: str) -> bool:
+    """True if the payload stores into any attribute (``x.attr = ...``).
+
+    Such a store can rebind what ``re.compile`` resolves to through an alias or a
+    computed reference -- ``m = re; m.compile = exec``, ``[re][0].compile = exec``,
+    ``type(re).__getattribute__ = exec`` -- that the per-name binding walk cannot
+    follow, so no module name is a proven, unmutated receiver once one is present.
+    A view the parser rejects (a heredoc body the shell split into words) falls
+    back to the lexical regex.
+    """
+    try:
+        tree = ast.parse(view)
+    except (SyntaxError, ValueError, RecursionError, MemoryError, SystemError):
+        return bool(_ATTR_STORE_RE.search(view))
+    return any(
+        isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del))
+        for node in ast.walk(tree)
+    )
+
+
+def _loader_method_is_exempt(receiver: str | None, foreign: frozenset[str]) -> bool:
+    """True if a loader called as ``<receiver>.loader(...)`` is NOT the builtin.
+
+    Exempt ONLY a receiver positively bound to a non-owner module. A grouped,
+    computed or dotted receiver (``None``), a bare word (``""``), an owner module
+    and every name not bound by an import all fail closed to the builtin -- a
+    receiver that could be the real module is never exempt.
+    """
+    return receiver is not None and receiver in foreign
+
+
+def _dotted_receiver(head_text: str) -> str | None:
+    """The receiver of a dotted head: a lone bare name, ``""`` for a bare word, or
+    ``None`` for a multi-component (computed) receiver that fails closed."""
+    parts = [part.strip() for part in head_text.split(".")]
+    if len(parts) == 1:
+        return ""
+    if len(parts) == 2:
+        return parts[0]
+    return None
+
+
 def _expression_start(view: str, position: int) -> int:
     """Where the dotted expression ending at *position* begins.
 
@@ -402,6 +685,7 @@ def _indirect_heads(
     for match in _ATTRIBUTE_SUBSCRIPT_RE.finditer(view):
         if match.group(2) in _RESOLVABLE_NAMES:
             heads.append((_expression_start(view, match.start()), match.end(), match.group(2)))
+    foreign: "frozenset[str] | None" = None  # computed once, only if a grouped loader appears
     for opening, arguments in brackets.items():
         if not arguments:
             continue
@@ -416,10 +700,16 @@ def _indirect_heads(
         closing = arguments[-1][1]
         if closing >= len(view) or view[closing] != ")":
             continue
-        dotted = _DOTTED_HEAD_RE.match(_unwrapped_head(view[opening:closing]))
+        head_text = _unwrapped_head(view[opening:closing])
+        dotted = _DOTTED_HEAD_RE.match(head_text)
         if dotted is None:
             continue
         word = dotted.group(1)
+        if word == "compile":  # exemption is limited to compile (the reported method)
+            if foreign is None:
+                foreign = _foreign_module_names(view)
+            if _loader_method_is_exempt(_dotted_receiver(head_text), foreign):
+                continue  # a grouped compile off a non-owner module is not the builtin
         canonical = word if word in _RESOLVABLE_NAMES else (aliases or {}).get(word)
         if canonical is not None:
             heads.append((opening - 1, closing + 1, canonical))
@@ -448,6 +738,7 @@ def _callable_aliases(
         for item, start, _ in _lex(view)
         if item.type not in (tokenize.COMMENT, tokenize.NL, tokenize.ENCODING)
     ]
+    foreign = _foreign_module_names(view)
     aliases: dict[str, str] = {}
     index = 0
     while index < len(items):
@@ -479,18 +770,23 @@ def _callable_aliases(
         # its result, so a trailing ``(`` disqualifies the binding.
         if item.type == token.NAME and index + 2 < len(items) and items[index + 1][0].string == "=":
             cursor = index + 2
-            last = None
+            components: list[str] = []
             while cursor < len(items) and items[cursor][0].type == token.NAME:
-                last = items[cursor][0].string
+                components.append(items[cursor][0].string)
                 cursor += 1
                 if cursor < len(items) and items[cursor][0].string == ".":
                     cursor += 1
                     continue
                 break
+            last = components[-1] if components else None
             if last in _RESOLVABLE_NAMES and (
                 cursor >= len(items) or items[cursor][0].string != "("
             ):
-                aliases[item.string] = last
+                # Bind a loader only off a bare name or its owning module; a lone
+                # foreign receiver (``c = re.compile``) is the receiver's method.
+                receiver = components[-2] if len(components) == 2 else None
+                if not (last == "compile" and _loader_method_is_exempt(receiver, foreign)):
+                    aliases[item.string] = last
         index += 1
     for head, _, canonical in _indirect_heads(view, spans, brackets):
         binding = _ALIAS_BINDING_RE.search(view[:head])
@@ -520,6 +816,7 @@ def _resolved_calls(
     if brackets is None:
         brackets = _argument_spans(view)
     aliases = _callable_aliases(view, spans, brackets)
+    foreign = _foreign_module_names(view)
     resolved: list[tuple[str, int, int, int]] = []
     for name, start, end in spans:
         written = _CALL_NAME_RE.match(view, name)
@@ -527,6 +824,14 @@ def _resolved_calls(
             continue
         word = written.group(1)
         if word in _RESOLVABLE_NAMES:
+            # ``compile`` as a method is the builtin unless its receiver is PROVEN
+            # unrelated; a grouped or computed receiver fails closed.
+            if (
+                word == "compile"
+                and _preceded_by_attribute_access(view, name)
+                and _loader_method_is_exempt(_attribute_receiver(view, name), foreign)
+            ):
+                continue
             resolved.append((word, name, start, end))
             continue
         canonical = aliases.get(word)
