@@ -29,7 +29,7 @@ from kiro_crew.knowledge.llm_pool import (
 )
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.store import KnowledgeStore
-from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
+from kiro_crew.testing.wait import await_until, finished
 
 # kiro-cli 3.4.0's own answer to session/new with no sign-in, as the client raises it.
 _SIGNED_OUT = AcpError(
@@ -154,33 +154,43 @@ class TestTheWorkerNamesTheSignIn:
         assert info.value is err
 
 
-class TestTheBatchAnswersAtTheFirstRefusal:
-    def test_the_refusal_does_not_wait_for_the_other_items(self):
-        """gather raises the first refusal at once; nothing has to be cancelled."""
+class TestTheBatchDrainsBeforeRaisingTheRefusal:
+    def test_the_refusal_waits_for_in_flight_items_without_cancelling_them(self):
+        """A refusal waits for b's backend turn before its worker can be reused."""
         pool = LLMPool.__new__(LLMPool)
         b_started = asyncio.Event()
+        a_refused = asyncio.Event()
         release_b = asyncio.Event()
+        b_completed = asyncio.Event()
         b_task: list[asyncio.Task] = []
 
-        async def _send(prompt, timeout=0):
+        async def _send(prompt, timeout=0, *, should_stop=None):
             if prompt == "a":
-                await b_started.wait()  # refuse only once b is in flight
+                await await_until(b_started, what="b in flight before the refusal")
+                a_refused.set()
                 raise KnowledgeKiroCliSignedOut()
             b_task.append(asyncio.current_task())  # type: ignore[arg-type]
             b_started.set()
-            await release_b.wait()
+            await await_until(release_b, what="release of b's backend turn")
+            b_completed.set()
             return "late"
 
         pool.send = _send  # type: ignore[method-assign]
 
         async def _run() -> None:
             batch = asyncio.create_task(pool.send_batch(["a", "b"]))
-            with pytest.raises(KnowledgeKiroCliSignedOut):
-                await asyncio.wait_for(batch, timeout=FALLBACK_TIMEOUT_SECS)
+            try:
+                await await_until(a_refused, what="a refused while b is in flight")
+                assert not batch.done()
+                assert not b_completed.is_set()
+            finally:
+                release_b.set()
+                with pytest.raises(KnowledgeKiroCliSignedOut):
+                    await finished(batch, "the batch after b finishes")
             (b,) = b_task
-            assert not b.done()  # b was still pending when the refusal came
-            release_b.set()
-            await asyncio.wait_for(b, timeout=FALLBACK_TIMEOUT_SECS)
+            assert b_completed.is_set()
+            assert b.done()
+            assert not b.cancelled()
 
         asyncio.run(_run())
 

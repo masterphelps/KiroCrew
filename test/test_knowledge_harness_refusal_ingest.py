@@ -18,9 +18,17 @@ import pytest
 from kiro_crew.knowledge.chunker import HeadingAwareChunker
 from kiro_crew.knowledge.extractor import EntityExtractor
 from kiro_crew.knowledge.ingestion import IngestionPipeline
-from kiro_crew.knowledge.llm_pool import KnowledgeHarnessUnavailable, LLMPool, _kiro_fallback
+from kiro_crew.knowledge.llm_pool import (
+    KnowledgeHarnessUnavailable,
+    KnowledgeSpecUnconfirmed,
+    LLMPool,
+    LLMPoolClosed,
+    Worker,
+    _kiro_fallback,
+)
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.store import KnowledgeStore
+from kiro_crew.testing.wait import await_until, finished, until_parked
 
 _REPLY = json.dumps(
     {"title": "t", "entities": [], "relations": [], "category": "document", "summary": "s"}
@@ -95,7 +103,7 @@ class TestThePoolAndExtractorPassTheRefusalOn:
     def test_send_batch_raises_the_refusal(self, lts):
         pool = LLMPool.__new__(LLMPool)
 
-        async def _send(prompt, timeout=0):
+        async def _send(prompt, timeout=0, *, should_stop=None):
             _kiro_fallback("no client")
 
         pool.send = _send  # type: ignore[method-assign]
@@ -105,11 +113,243 @@ class TestThePoolAndExtractorPassTheRefusalOn:
     def test_send_batch_still_blanks_any_other_failure(self):
         pool = LLMPool.__new__(LLMPool)
 
-        async def _send(prompt, timeout=0):
+        async def _send(prompt, timeout=0, *, should_stop=None):
             raise RuntimeError("worker died")
 
         pool.send = _send  # type: ignore[method-assign]
         assert asyncio.run(pool.send_batch(["a", "b"])) == ["", ""]
+
+    @pytest.mark.parametrize(
+        "refusal_type", [KnowledgeHarnessUnavailable, KnowledgeSpecUnconfirmed, LLMPoolClosed]
+    )
+    def test_a_refusal_skips_unsent_items_and_finishes_in_flight_items(self, refusal_type):
+        async def _run():
+            pool = LLMPool.__new__(LLMPool)
+            refusal = refusal_type() if refusal_type is LLMPoolClosed else refusal_type("refused")
+            b_started = asyncio.Event()
+            release_b = asyncio.Event()
+            reached_send: list[str] = []
+            completed: list[str] = []
+            cancelled: list[str] = []
+
+            async def _send(prompt, timeout=0, *, should_stop=None):
+                reached_send.append(prompt)
+                if prompt == "a":
+                    await await_until(b_started, what="b in flight before the refusal")
+                    release_b.set()
+                    raise refusal
+                if prompt == "b":
+                    b_started.set()
+                    try:
+                        await await_until(release_b, what="b released by the refusal")
+                    except asyncio.CancelledError:
+                        cancelled.append(prompt)
+                        raise
+                completed.append(prompt)
+                return "reply"
+
+            pool.send = _send  # type: ignore[method-assign]
+            # b parks first; a refuses without yielding once b has started, so
+            # c reaches the batch's pre-send check only after the refusal.
+            with pytest.raises(refusal_type) as info:
+                await finished(pool.send_batch(["b", "a", "c"]), "the refused batch")
+            assert info.value is refusal
+            assert reached_send == ["b", "a"]
+            assert completed == ["b"]
+            assert cancelled == []
+
+        asyncio.run(_run())
+
+    @pytest.mark.parametrize("dead_after_refusal", [True, False])
+    def test_queued_items_raise_the_first_refusal_at_checkout(
+        self, monkeypatch, dead_after_refusal
+    ):
+        async def _run():
+            pool = LLMPool(pool_size=1)
+            refusal = KnowledgeHarnessUnavailable("refused")
+            reached_send = []
+            raised = {}
+            created = []
+            created_at_refusal = []
+
+            class _Worker(Worker):
+                alive = True
+
+                async def start(self):
+                    pass
+
+                async def shutdown(self):
+                    self.alive = False
+
+                def is_alive(self):
+                    return self.alive
+
+                async def reset_conversation(self):
+                    pass
+
+                async def send_message(self, prompt, timeout=0):
+                    reached_send.append(prompt)
+                    if prompt == "a":
+                        await until_parked(pool._semaphore, count=2)
+                        created_at_refusal.append(len(created))
+                        self.alive = not dead_after_refusal
+                        raise refusal
+                    return "reply"
+
+            async def _create_worker():
+                worker = _Worker()
+                created.append(worker)
+                return worker
+
+            real_send = pool.send
+
+            async def _send(prompt, **kwargs):
+                try:
+                    return await real_send(prompt, **kwargs)
+                except KnowledgeHarnessUnavailable as exc:
+                    raised[prompt] = exc
+                    raise
+
+            monkeypatch.setattr("kiro_crew.knowledge.llm_pool._read_config", lambda: {})
+            monkeypatch.setattr(pool, "_create_worker", _create_worker)
+            monkeypatch.setattr(pool, "send", _send)
+            try:
+                await pool.start()
+                with pytest.raises(KnowledgeHarnessUnavailable) as info:
+                    await finished(pool.send_batch(["a", "b", "c"]), "queued refusal batch")
+                assert info.value is refusal
+                assert len(created) == created_at_refusal[0] == 1
+                assert reached_send == ["a"]
+                assert set(raised) == {"a", "b", "c"}
+                assert all(exc is refusal for exc in raised.values())
+                assert pool._in_use == 0
+                assert pool._available.qsize() == 1
+                assert created[0].calls_since_reset == 1
+                # Every stopped checkout returned its slot; an ordinary send still works.
+                created[0].alive = True
+                assert await finished(pool.send("d"), "send after refused batch") == "reply"
+            finally:
+                await pool.shutdown()
+
+        asyncio.run(_run())
+
+    def test_cold_pool_waiters_raise_the_first_startup_refusal(self, monkeypatch):
+        async def _run():
+            pool = LLMPool(pool_size=1)
+            refusal = KnowledgeHarnessUnavailable("refused")
+            created = 0
+
+            async def _create_worker():
+                nonlocal created
+                created += 1
+                if created == 1:
+                    await until_parked(pool._start_lock, count=2)
+                raise refusal
+
+            monkeypatch.setattr("kiro_crew.knowledge.llm_pool._read_config", lambda: {})
+            monkeypatch.setattr(pool, "_create_worker", _create_worker)
+            try:
+                with pytest.raises(KnowledgeHarnessUnavailable) as info:
+                    await finished(pool.send_batch(["a", "b", "c"]), "cold pool refusal batch")
+                assert info.value is refusal
+                assert created == 1
+                assert not pool._started
+                assert pool._workers == []
+                assert pool._available.empty()
+                assert pool._in_use == 0
+                assert not pool._semaphore.locked()
+                assert not pool._start_lock.locked()
+            finally:
+                await pool.shutdown()
+
+        asyncio.run(_run())
+
+    def test_stop_before_start_holds_no_slot(self, monkeypatch):
+        async def _run():
+            pool = LLMPool(pool_size=1)
+            refusal = KnowledgeHarnessUnavailable("refused")
+
+            async def _create_worker():
+                pytest.fail("a stopped checkout must not start a worker")
+
+            monkeypatch.setattr(pool, "_create_worker", _create_worker)
+            try:
+                with pytest.raises(KnowledgeHarnessUnavailable) as info:
+                    await pool.send("a", should_stop=lambda: refusal)
+                assert info.value is refusal
+                assert not pool._started
+                assert pool._in_use == 0
+                assert pool._available.empty()
+                assert not pool._semaphore.locked()
+            finally:
+                await pool.shutdown()
+
+        asyncio.run(_run())
+
+    def test_real_pool_finishes_an_in_flight_turn_after_refusal(self, monkeypatch):
+        async def _run():
+            pool = LLMPool(pool_size=2)
+            refusal = KnowledgeHarnessUnavailable("refused")
+            b_started = asyncio.Event()
+            a_refused = asyncio.Event()
+            release_b = asyncio.Event()
+            completed = []
+
+            class _Worker(Worker):
+                async def start(self):
+                    pass
+
+                async def shutdown(self):
+                    pass
+
+                def is_alive(self):
+                    return True
+
+                async def reset_conversation(self):
+                    pass
+
+                async def send_message(self, prompt, timeout=0):
+                    if prompt == "a":
+                        await await_until(b_started, what="b's backend turn started")
+                        raise refusal
+                    b_started.set()
+                    await await_until(release_b, what="b's backend turn released")
+                    completed.append(prompt)
+                    return "reply"
+
+            async def _create_worker():
+                return _Worker()
+
+            real_send = pool.send
+
+            async def _send(prompt, **kwargs):
+                try:
+                    return await real_send(prompt, **kwargs)
+                except KnowledgeHarnessUnavailable:
+                    a_refused.set()
+                    raise
+
+            monkeypatch.setattr("kiro_crew.knowledge.llm_pool._read_config", lambda: {})
+            monkeypatch.setattr(pool, "_create_worker", _create_worker)
+            monkeypatch.setattr(pool, "send", _send)
+            batch = asyncio.create_task(pool.send_batch(["a", "b"]))
+            try:
+                await await_until(a_refused, what="a's refusal propagated")
+                assert not batch.done()
+                assert completed == []
+            finally:
+                release_b.set()
+                try:
+                    with pytest.raises(KnowledgeHarnessUnavailable) as info:
+                        await finished(batch, "batch after in-flight turn finishes")
+                    assert info.value is refusal
+                    assert completed == ["b"]
+                    assert pool._in_use == 0
+                    assert pool._available.qsize() == 2
+                finally:
+                    await pool.shutdown()
+
+        asyncio.run(_run())
 
     def test_extractor_raises_the_refusal(self, lts, pool):
         extractor = EntityExtractor(pool=pool)  # type: ignore[arg-type]
