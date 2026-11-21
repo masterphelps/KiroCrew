@@ -498,9 +498,13 @@ def sensitive_write_path_refusal(path_str: str, base_dir: str | None = None) -> 
             matched = _path_in_home_dirs(path_str, rule_rows, base_dir, strict=True)
         matched = matched or _native_store_write(path_str, base_dir)
         matched = matched or _install_root_write(path_str, base_dir)
+        remedy = matched and _path_in_home_dirs(path_str, _MCP_REGISTRY_ROWS, base_dir, strict=True)
     except PathResolutionStalled as exc:
         return _stall_refusal(exc, path_str)
-    return f"Blocked: write to protected path: {path_str}" if matched else None
+    if not matched:
+        return None
+    refusal = f"Blocked: write to protected path: {path_str}"
+    return f"{refusal}. {MCP_REGISTRY_REMEDY}" if remedy else refusal
 
 
 def _stall_refusal(exc: PathResolutionStalled, path_str: str) -> str:
@@ -846,8 +850,10 @@ from .paths_lists import (  # noqa: E402
     _KEYSTONE_ARTIFACT_PARENTS,
     _KEYSTONE_ARTIFACT_SUFFIXES,
     _KIRO_PERMISSION_RULE_LEAVES,
+    _MCP_REGISTRY_ROWS,
     _SENSITIVE_HOME_DIRS,
     _WRITE_PROTECTED_HOME_PATHS,
+    MCP_REGISTRY_REMEDY,
     _leaf_segments,
     _native_store_write,
 )
